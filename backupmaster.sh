@@ -132,6 +132,28 @@ create_backup() {
             ;;
     esac
 
+    # Создание подпапки backups
+    BACKUP_DIR="$BACKUP_BASE/backups"
+    if [ "$BACKUP_DEST" != "3" ]; then  # Для прямого SSH подпапка создаётся на сервере
+        if [ ! -d "$BACKUP_DIR" ]; then
+            mkdir -p "$BACKUP_DIR"
+            if [ $? -ne 0 ]; then
+                echo -e "${RED}Не удалось создать папку $BACKUP_DIR${NC}"
+                return
+            fi
+        fi
+        if [ ! -w "$BACKUP_DIR" ]; then
+            echo -e "${RED}Нет прав на запись в $BACKUP_DIR${NC}"
+            return
+        fi
+    else
+        ssh "${REMOTE_DEST%%:*}" "mkdir -p '$REMOTE_PATH/backups'" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}Не удалось создать папку backups на сервере${NC}"
+            return
+        fi
+    fi
+
     # Список пользователей с домашними директориями в /home и UID >= 1000
     echo -e "${GREEN}Поиск пользователей для бэкапа...${NC}"
     USERS=($(get_users))
@@ -173,11 +195,11 @@ create_backup() {
 
     # Бэкап источников пакетов
     echo -e "${GREEN}Создание бэкапа источников пакетов...${NC}"
-    APT_BACKUP="$BACKUP_BASE/apt_sources_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+    APT_BACKUP="$BACKUP_DIR/apt_sources_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
     APT_SIZE=$(estimate_apt_backup_size)
     echo "Примерный размер бэкапа источников: ${APT_SIZE} МБ"
     if [ "$BACKUP_DEST" = "3" ]; then
-        APT_REMOTE_PATH="$REMOTE_PATH/apt_sources_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+        APT_REMOTE_PATH="$REMOTE_PATH/backups/apt_sources_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
         sudo tar -cz /etc/apt/sources.list /etc/apt/sources.list.d 2>tar_errors.log | ssh "${REMOTE_DEST%%:*}" "cat > $APT_REMOTE_PATH"
         if [ $? -eq 0 ]; then
             echo "Бэкап источников создан: $APT_REMOTE_PATH"
@@ -249,9 +271,9 @@ create_backup() {
         fi
 
         echo -e "${GREEN}Создание бэкапа для $user...${NC}"
-        USER_BACKUP="$BACKUP_BASE/home_backup_${user}_$(date +%Y%m%d_%H%M%S).tar.gz"
+        USER_BACKUP="$BACKUP_DIR/home_backup_${user}_$(date +%Y%m%d_%H%M%S).tar.gz"
         if [ "$BACKUP_DEST" = "3" ]; then
-            USER_REMOTE_PATH="$REMOTE_PATH/home_backup_${user}_$(date +%Y%m%d_%H%M%S).tar.gz"
+            USER_REMOTE_PATH="$REMOTE_PATH/backups/home_backup_${user}_$(date +%Y%m%d_%H%M%S).tar.gz"
             sudo tar -cz "$USER_HOME" 2>tar_errors.log | ssh "${REMOTE_DEST%%:*}" "cat > $USER_REMOTE_PATH"
             if [ $? -eq 0 ]; then
                 echo "Бэкап пользователя $user создан: $USER_REMOTE_PATH"
@@ -304,9 +326,10 @@ create_backup() {
 # Функция для восстановления бэкапа
 restore_backup() {
     echo -e "${GREEN}Доступные локальные бэкапы:${NC}"
-    BACKUP_FILES=("$LOCAL_BACKUP_DIR"/home_backup_*.tar.gz "$LOCAL_BACKUP_DIR"/apt_sources_backup_*.tar.gz)
+    BACKUP_DIR="$LOCAL_BACKUP_DIR/backups"
+    BACKUP_FILES=("$BACKUP_DIR"/home_backup_*.tar.gz "$BACKUP_DIR"/apt_sources_backup_*.tar.gz)
     if [ ${#BACKUP_FILES[@]} -eq 0 ] || [ ! -e "${BACKUP_FILES[0]}" ]; then
-        echo -e "${RED}Локальные бэкапы не найдены${NC}"
+        echo -e "${RED}Локальные бэкапы не найдены в $BACKUP_DIR${NC}"
         return
     fi
 
@@ -422,9 +445,10 @@ restore_backup() {
 # Функция для удаления локальных бэкапов
 delete_backups() {
     echo -e "${GREEN}Доступные локальные бэкапы:${NC}"
-    BACKUP_FILES=("$LOCAL_BACKUP_DIR"/home_backup_*.tar.gz "$LOCAL_BACKUP_DIR"/apt_sources_backup_*.tar.gz)
+    BACKUP_DIR="$LOCAL_BACKUP_DIR/backups"
+    BACKUP_FILES=("$BACKUP_DIR"/home_backup_*.tar.gz "$BACKUP_DIR"/apt_sources_backup_*.tar.gz)
     if [ ${#BACKUP_FILES[@]} -eq 0 ] || [ ! -e "${BACKUP_FILES[0]}" ]; then
-        echo -e "${RED}Локальные бэкапы не найдены${NC}"
+        echo -e "${RED}Локальные бэкапы не найдены в $BACKUP_DIR${NC}"
         return
     fi
 
