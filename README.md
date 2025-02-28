@@ -1,1 +1,1 @@
-# packhomebackupmaster
+This script backups user folders locally or via SSH. It allows you to restore a backup of the user's home directory. The script also backups the list of repositories as well as the list of installed packages.Enjoy.
