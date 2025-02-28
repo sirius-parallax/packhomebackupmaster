@@ -5,13 +5,14 @@ GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
-# Основные пути и файлы
-LOCAL_BACKUP_DIR=$(pwd)  # Локальная директория по умолчанию
-PACKAGE_LIST="$LOCAL_BACKUP_DIR/installed_packages.txt"
+# Основной путь
+SCRIPT_DIR=$(pwd)  # Директория, где запускается скрипт
+BACKUP_DIR="$SCRIPT_DIR/backups"  # Папка для бэкапов
 
 # Проверка зависимостей
-if ! command -v lsof >/dev/null 2>&1; then
-    echo -e "${RED}Утилита lsof не установлена. Установите её: 'sudo apt install lsof'.${NC}"
+if ! command -v tar >/dev/null 2>&1; then
+    echo -e "${RED}Утилита tar не установлена. Установите её: 'sudo apt install tar'.${NC}"
+    exit 1
 fi
 if ! command -v du >/dev/null 2>&1; then
     echo -e "${RED}Утилита du не установлена. Установите её: 'sudo apt install coreutils'.${NC}"
@@ -22,30 +23,23 @@ if ! command -v df >/dev/null 2>&1; then
     exit 1
 fi
 
-# Функция для оценки размера папки пользователя
-estimate_user_backup_size() {
-    local user_dir="/home/$1"
-    if [ -d "$user_dir" ]; then
-        local size=$(sudo du -sb "$user_dir" 2>/dev/null | awk '{print $1}')
-        local compressed_bytes=$((size / 3))
-        local size_mb=$((compressed_bytes / 1024 / 1024))
+# Функция для оценки размера папки (в МБ)
+estimate_size() {
+    local path="$1"
+    if [ -d "$path" ]; then
+        local size=$(sudo du -sb "$path" 2>/dev/null | awk '{print $1}')  # Размер в байтах
+        local compressed_bytes=$((size / 3))  # Примерный коэффициент сжатия
+        local size_mb=$((compressed_bytes / 1024 / 1024))  # Перевод в МБ
         echo "$size_mb"
     else
         echo "0"
     fi
 }
 
-# Функция для оценки размера источников пакетов
-estimate_apt_backup_size() {
-    local size=$(sudo du -sb /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | awk '{sum += $1} END {print sum}')
-    local compressed_bytes=$((size / 3))
-    local size_mb=$((compressed_bytes / 1024 / 1024))
-    echo "$size_mb"
-}
-
-# Функция для поиска примонтированных устройств
-list_mounted_devices() {
-    df -h | grep -E '/dev/' | awk '$NF ~ /^\/media|^\/mnt/ {print $NF}' | sort -u
+# Функция для получения свободного места в корневом разделе (в МБ)
+get_free_space() {
+    local free_space=$(df -B1M / | tail -n 1 | awk '{print $4}')  # Свободное место в МБ
+    echo "$free_space"
 }
 
 # Функция для получения списка пользователей с домашними директориями в /home
@@ -53,124 +47,38 @@ get_users() {
     awk -F: '$3 >= 1000 && $6 ~ /^\/home\// && $1 !~ /^(nobody|nogroup)$/ {print $1}' /etc/passwd | sort -u
 }
 
-# Функция для создания бэкапа
-create_backup() {
-    echo -e "${GREEN}Куда сохранить бэкап?${NC}"
-    echo "1. Локально в текущую директорию ($LOCAL_BACKUP_DIR)"
-    echo "2. Удалённый сервер (через SSH, локально+scp)"
-    echo "3. Удалённый сервер (прямой бэкап через SSH)"
-    echo "4. Указать свой локальный путь"
-    echo "5. Выбрать примонтированное устройство"
-    echo "q. Вернуться в главное меню"
-    read -p "Выберите вариант (1-5 или q): " BACKUP_DEST
-
-    if [ "$BACKUP_DEST" = "q" ]; then
-        echo "Возврат в главное меню."
-        return
-    fi
-
-    BACKUP_BASE=""
-    REMOTE_DEST=""
-    REMOTE_PATH=""
-
-    case $BACKUP_DEST in
-        1)
-            BACKUP_BASE="$LOCAL_BACKUP_DIR"
-            if [ ! -w "$BACKUP_BASE" ]; then
-                echo -e "${RED}Нет прав на запись в $BACKUP_BASE${NC}"
-                return
-            fi
-            ;;
-        2|3)
-            read -p "Введите SSH-адрес (например, user@host:/path/to/backup): " REMOTE_DEST
-            ssh -q -o BatchMode=yes -o ConnectTimeout=5 "${REMOTE_DEST%%:*}" "exit" 2>/dev/null
-            if [ $? -ne 0 ]; then
-                echo -e "${RED}Не удалось подключиться к удалённому серверу${NC}"
-                return
-            fi
-            REMOTE_PATH="${REMOTE_DEST#*:}"
-            if [ "$BACKUP_DEST" = "2" ]; then
-                BACKUP_BASE="$LOCAL_BACKUP_DIR"
-            fi
-            ;;
-        4)
-            read -p "Введите полный путь для сохранения бэкапа: " CUSTOM_PATH
-            if [ ! -d "$CUSTOM_PATH" ]; then
-                echo -e "${RED}Директория $CUSTOM_PATH не существует${NC}"
-                return
-            fi
-            if [ ! -w "$CUSTOM_PATH" ]; then
-                echo -e "${RED}Нет прав на запись в $CUSTOM_PATH${NC}"
-                return
-            fi
-            BACKUP_BASE="$CUSTOM_PATH"
-            ;;
-        5)
-            echo -e "${GREEN}Доступные примонтированные устройства:${NC}"
-            MOUNTED_DEVICES=($(list_mounted_devices))
-            if [ ${#MOUNTED_DEVICES[@]} -eq 0 ]; then
-                echo -e "${RED}Устройства не найдены${NC}"
-                return
-            fi
-            for i in "${!MOUNTED_DEVICES[@]}"; do
-                echo "$((i+1)). ${MOUNTED_DEVICES[$i]}"
-            done
-            read -p "Выберите устройство (номер): " DEVICE_CHOICE
-            if ! [[ "$DEVICE_CHOICE" =~ ^[0-9]+$ ]] || [ "$DEVICE_CHOICE" -lt 1 ] || [ "$DEVICE_CHOICE" -gt ${#MOUNTED_DEVICES[@]} ]; then
-                echo -e "${RED}Неверный выбор${NC}"
-                return
-            fi
-            BACKUP_BASE="${MOUNTED_DEVICES[$((DEVICE_CHOICE-1))]}"
-            if [ ! -w "$BACKUP_BASE" ]; then
-                echo -e "${RED}Нет прав на запись в $BACKUP_BASE${NC}"
-                return
-            fi
-            ;;
-        *)
-            echo -e "${RED}Неверный выбор${NC}"
-            return
-            ;;
-    esac
-
-    # Создание подпапки backups
-    BACKUP_DIR="$BACKUP_BASE/backups"
-    if [ "$BACKUP_DEST" != "3" ]; then  # Для прямого SSH подпапка создаётся на сервере
-        if [ ! -d "$BACKUP_DIR" ]; then
-            mkdir -p "$BACKUP_DIR"
-            if [ $? -ne 0 ]; then
-                echo -e "${RED}Не удалось создать папку $BACKUP_DIR${NC}"
-                return
-            fi
-        fi
-        if [ ! -w "$BACKUP_DIR" ]; then
-            echo -e "${RED}Нет прав на запись в $BACKUP_DIR${NC}"
-            return
-        fi
-    else
-        ssh "${REMOTE_DEST%%:*}" "mkdir -p '$REMOTE_PATH/backups'" 2>/dev/null
+# Функция для создания бэкапа пользователей
+backup_users() {
+    # Создание папки backups, если её нет
+    if [ ! -d "$BACKUP_DIR" ]; then
+        sudo mkdir -p "$BACKUP_DIR"
         if [ $? -ne 0 ]; then
-            echo -e "${RED}Не удалось создать папку backups на сервере${NC}"
+            echo -e "${RED}Не удалось создать папку $BACKUP_DIR${NC}"
+            return
+        fi
+    fi
+    if [ ! -w "$BACKUP_DIR" ]; then
+        sudo chmod u+w "$BACKUP_DIR"
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}Нет прав на запись в $BACKUP_DIR и не удалось их изменить${NC}"
             return
         fi
     fi
 
-    # Список пользователей с домашними директориями в /home и UID >= 1000
-    echo -e "${GREEN}Поиск пользователей для бэкапа...${NC}"
+    echo -e "${GREEN}Поиск пользователей...${NC}"
     USERS=($(get_users))
     if [ ${#USERS[@]} -eq 0 ]; then
         echo -e "${RED}Пользователи с UID >= 1000 и директориями в /home не найдены${NC}"
-        echo "Содержимое /etc/passwd (для отладки):"
-        awk -F: '$3 >= 1000 {print $1 " UID:" $3 " Home:" $6}' /etc/passwd | head -n 10
         return
     fi
 
     echo "Список пользователей для бэкапа:"
     for i in "${!USERS[@]}"; do
-        USER_SIZE=$(estimate_user_backup_size "${USERS[$i]}")
+        USER_SIZE=$(estimate_size "/home/${USERS[$i]}")
         echo "$((i+1)). Пользователь: ${USERS[$i]} (примерный размер бэкапа: ${USER_SIZE} МБ)"
     done
-    echo "all. Забэкапить всех пользователей"
-    read -p "Выберите номер пользователя или 'all' для всех: " USER_CHOICE
+    echo "all. Забэкапить всех"
+    read -p "Выберите номер пользователя или 'all': " USER_CHOICE
 
     if [ "$USER_CHOICE" = "all" ]; then
         SELECTED_USERS=("${USERS[@]}")
@@ -184,280 +92,176 @@ create_backup() {
         echo "Выбран пользователь: ${SELECTED_USERS[0]}"
     fi
 
-    echo -e "${GREEN}Создание списка установленных пакетов...${NC}"
-    dpkg --get-selections > "$PACKAGE_LIST"
-    if [ $? -eq 0 ]; then
-        echo "Список пакетов сохранён: $PACKAGE_LIST"
-    else
-        echo -e "${RED}Ошибка при создании списка пакетов${NC}"
-        return
-    fi
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-    # Бэкап источников пакетов
-    echo -e "${GREEN}Создание бэкапа источников пакетов...${NC}"
-    APT_BACKUP="$BACKUP_DIR/apt_sources_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
-    APT_SIZE=$(estimate_apt_backup_size)
-    echo "Примерный размер бэкапа источников: ${APT_SIZE} МБ"
-    if [ "$BACKUP_DEST" = "3" ]; then
-        APT_REMOTE_PATH="$REMOTE_PATH/backups/apt_sources_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
-        sudo tar -cz /etc/apt/sources.list /etc/apt/sources.list.d 2>tar_errors.log | ssh "${REMOTE_DEST%%:*}" "cat > $APT_REMOTE_PATH"
-        if [ $? -eq 0 ]; then
-            echo "Бэкап источников создан: $APT_REMOTE_PATH"
-            rm -f tar_errors.log
-        else
-            echo -e "${RED}Ошибка при создании бэкапа источников:${NC}"
-            cat tar_errors.log
-            return
-        fi
-    else
-        sudo tar -czf "$APT_BACKUP" /etc/apt/sources.list /etc/apt/sources.list.d 2>tar_errors.log
-        if [ $? -eq 0 ]; then
-            echo "Бэкап источников создан: $APT_BACKUP"
-            rm -f tar_errors.log
-        else
-            echo -e "${RED}Ошибка при создании бэкапа источников:${NC}"
-            cat tar_errors.log
-            return
-        fi
-
-        if [ "$BACKUP_DEST" = "2" ]; then
-            echo -e "${GREEN}Отправка бэкапа источников на сервер: $REMOTE_DEST${NC}"
-            scp "$APT_BACKUP" "$REMOTE_DEST"
-            if [ $? -eq 0 ]; then
-                echo "Бэкап источников отправлен"
-                read -p "Удалить локальную копию? (y/n): " DELETE_LOCAL
-                if [ "$DELETE_LOCAL" = "y" ]; then
-                    rm -f "$APT_BACKUP"
-                    echo "Локальная копия удалена"
-                fi
-            else
-                echo -e "${RED}Ошибка при отправке${NC}"
-            fi
-        fi
-    fi
-
-    # Бэкап каждого пользователя в отдельный архив
+    # Создание бэкапов с предварительной оценкой размера
     for user in "${SELECTED_USERS[@]}"; do
         USER_HOME="/home/$user"
         if [ ! -d "$USER_HOME" ]; then
-            echo -e "${RED}Домашняя директория $USER_HOME не найдена${NC}"
+            echo -e "${RED}Директория $USER_HOME не найдена${NC}"
             continue
         fi
 
-        echo -e "${GREEN}Проверка открытых файлов для $user...${NC}"
-        if command -v lsof >/dev/null 2>&1; then
-            OPEN_FILES=$(sudo lsof +D "$USER_HOME" 2>/dev/null | grep -v '^COMMAND' | awk '{print $NF}' | sort -u)
-            if [ -n "$OPEN_FILES" ]; then
-                echo -e "${RED}Обнаружены открытые файлы:${NC}"
-                PIDS=$(sudo lsof +D "$USER_HOME" 2>/dev/null | grep -v '^COMMAND' | awk '{print $2}' | sort -u)
-                echo "$OPEN_FILES" | while read -r file; do
-                    echo " - $file"
-                    sudo lsof "$file" 2>/dev/null | awk 'NR>1 {print "   Используется процессом: " $1 " (PID: " $2 ")"}'
-                done
-                read -p "Убить процессы для полного бэкапа $user? (y/n): " KILL_PROCESSES
-                if [ "$KILL_PROCESSES" = "y" ]; then
-                    echo "Убиваем процессы..."
-                    echo "$PIDS" | while read -r pid; do
-                        sudo kill -9 "$pid" 2>/dev/null
-                        if [ $? -eq 0 ]; then
-                            echo "Процесс PID $pid убит"
-                        else
-                            echo -e "${RED}Не удалось убить PID $pid${NC}"
-                        fi
-                    done
-                    sleep 1
-                fi
-            fi
-        fi
-
-        echo -e "${GREEN}Создание бэкапа для $user...${NC}"
-        USER_BACKUP="$BACKUP_DIR/home_backup_${user}_$(date +%Y%m%d_%H%M%S).tar.gz"
-        if [ "$BACKUP_DEST" = "3" ]; then
-            USER_REMOTE_PATH="$REMOTE_PATH/backups/home_backup_${user}_$(date +%Y%m%d_%H%M%S).tar.gz"
-            sudo tar -cz "$USER_HOME" 2>tar_errors.log | ssh "${REMOTE_DEST%%:*}" "cat > $USER_REMOTE_PATH"
-            if [ $? -eq 0 ]; then
-                echo "Бэкап пользователя $user создан: $USER_REMOTE_PATH"
-                rm -f tar_errors.log
-            else
-                echo -e "${RED}Ошибка при создании бэкапа $user:${NC}"
-                cat tar_errors.log
-                continue
-            fi
+        BACKUP_SIZE=$(estimate_size "$USER_HOME")
+        echo -e "${GREEN}Бэкап пользователя $user...${NC}"
+        echo "Примерный размер бэкапа: $BACKUP_SIZE МБ"
+        USER_BACKUP="$BACKUP_DIR/home_backup_${user}_$TIMESTAMP.tar.gz"
+        sudo tar -czf "$USER_BACKUP" "$USER_HOME" 2>tar_errors.log
+        if [ $? -eq 0 ]; then
+            echo "Домашняя директория $user забэкаплена: $USER_BACKUP"
+            rm -f tar_errors.log
         else
-            sudo tar -czf "$USER_BACKUP" "$USER_HOME" 2>tar_errors.log
-            if [ $? -eq 0 ]; then
-                echo "Бэкап пользователя $user создан: $USER_BACKUP"
-                rm -f tar_errors.log
-            else
-                echo -e "${RED}Ошибка при создании бэкапа $user:${NC}"
-                cat tar_errors.log
-                read -p "Повторить с игнорированием ошибок? (y/n): " RETRY
-                if [ "$RETRY" = "y" ]; then
-                    sudo tar -czf "$USER_BACKUP" --warning=no-file-changed "$USER_HOME"
-                    if [ $? -eq 0 ]; then
-                        echo "Бэкап создан: $USER_BACKUP"
-                    else
-                        echo -e "${RED}Не удалось создать бэкап $user${NC}"
-                        continue
-                    fi
-                else
-                    continue
-                fi
-            fi
-
-            if [ "$BACKUP_DEST" = "2" ]; then
-                echo -e "${GREEN}Отправка бэкапа $user на сервер: $REMOTE_DEST${NC}"
-                scp "$USER_BACKUP" "$REMOTE_DEST"
-                if [ $? -eq 0 ]; then
-                    echo "Бэкап $user отправлен"
-                    read -p "Удалить локальную копию? (y/n): " DELETE_LOCAL
-                    if [ "$DELETE_LOCAL" = "y" ]; then
-                        rm -f "$USER_BACKUP"
-                        echo "Локальная копия удалена"
-                    fi
-                else
-                    echo -e "${RED}Ошибка при отправке${NC}"
-                fi
-            fi
+            echo -e "${RED}Ошибка при бэкапе $user:${NC}"
+            cat tar_errors.log
+            rm -f tar_errors.log
+            continue
         fi
     done
 }
 
-# Функция для восстановления бэкапа
-restore_backup() {
-    echo -e "${GREEN}Доступные локальные бэкапы:${NC}"
-    BACKUP_DIR="$LOCAL_BACKUP_DIR/backups"
-    BACKUP_FILES=("$BACKUP_DIR"/home_backup_*.tar.gz "$BACKUP_DIR"/apt_sources_backup_*.tar.gz)
-    if [ ${#BACKUP_FILES[@]} -eq 0 ] || [ ! -e "${BACKUP_FILES[0]}" ]; then
-        echo -e "${RED}Локальные бэкапы не найдены в $BACKUP_DIR${NC}"
+# Функция для восстановления бэкапов пользователей
+restore_users() {
+    if [ ! -d "$BACKUP_DIR" ]; then
+        echo -e "${RED}Папка бэкапов $BACKUP_DIR не найдена${NC}"
         return
     fi
 
-    # Извлечение пользователей и источников из имён файлов бэкапа
-    declare -A USER_BACKUPS
-    APT_BACKUP=""
-    for file in "${BACKUP_FILES[@]}"; do
-        if [[ "$file" =~ home_backup_([^_]+)_[0-9]{8}_[0-9]{6}\.tar\.gz ]]; then
-            USER="${BASH_REMATCH[1]}"
-            USER_BACKUPS["$USER"]="$file"
-        elif [[ "$file" =~ apt_sources_backup_[0-9]{8}_[0-9]{6}\.tar\.gz ]]; then
-            APT_BACKUP="$file"
-        fi
+    USER_BACKUPS=("$BACKUP_DIR"/home_backup_*.tar.gz)
+
+    echo -e "${GREEN}Поиск бэкапов в $BACKUP_DIR...${NC}"
+    echo "Количество найденных бэкапов: ${#USER_BACKUPS[@]}"
+    echo "Список бэкапов:"
+    for file in "${USER_BACKUPS[@]}"; do
+        echo " - $file"
     done
 
-    if [ ${#USER_BACKUPS[@]} -eq 0 ] && [ -z "$APT_BACKUP" ]; then
-        echo -e "${RED}Не найдено бэкапов для восстановления${NC}"
+    if [ ${#USER_BACKUPS[@]} -eq 0 ] || [ ! -e "${USER_BACKUPS[0]}" ]; then
+        echo -e "${RED}Бэкапы пользователей не найдены в $BACKUP_DIR${NC}"
         return
     fi
 
-    if [ ${#USER_BACKUPS[@]} -gt 0 ]; then
-        echo "Список доступных пользователей для восстановления:"
-        i=1
-        declare -A USER_MAP
-        for user in "${!USER_BACKUPS[@]}"; do
-            echo "$i. Пользователь: $user (${USER_BACKUPS[$user]})"
-            USER_MAP[$i]="$user"
+    echo -e "${GREEN}Доступные бэкапы пользователей:${NC}"
+    i=1
+    declare -a BACKUP_LIST
+    for file in "${USER_BACKUPS[@]}"; do
+        if [[ "$file" =~ home_backup_(.+)_[0-9]{8}_[0-9]{6}\.tar\.gz ]]; then
+            USER="${BASH_REMATCH[1]}"
+            DATETIME=$(get_backup_datetime "$file")
+            echo "$i. Пользователь: $USER ($file, Создан: $DATETIME)"
+            BACKUP_LIST[$i]="$file"
             ((i++))
-        done
-    else
-        echo "Бэкапы пользователей не найдены"
+        else
+            echo "$i. Нераспознанный файл: $file"
+            BACKUP_LIST[$i]="$file"
+            ((i++))
+        fi
+    done
+    TOTAL_BACKUPS=$((i - 1))
+
+    if [ $TOTAL_BACKUPS -eq 0 ]; then
+        echo -e "${RED}Не найдено подходящих бэкапов для восстановления${NC}"
+        return
     fi
 
-    if [ -n "$APT_BACKUP" ]; then
-        echo "Бэкап источников пакетов: $APT_BACKUP"
-    fi
-
+    echo "all. Восстановить все"
     echo "q. Вернуться в главное меню"
-    read -p "Выберите номер пользователя (или 'q' для отмены): " USER_CHOICE
+    read -p "Выберите номер бэкапа, 'all' или 'q': " CHOICE
 
-    if [ "$USER_CHOICE" = "q" ]; then
+    if [ "$CHOICE" = "q" ]; then
         echo "Возврат в главное меню."
         return
     fi
 
-    if ! [[ "$USER_CHOICE" =~ ^[0-9]+$ ]] || [ "$USER_CHOICE" -lt 1 ] || [ "$USER_CHOICE" -gt ${#USER_BACKUPS[@]} ]; then
-        echo -e "${RED}Неверный выбор пользователя${NC}"
+    if [ "$CHOICE" = "all" ]; then
+        SELECTED_BACKUPS=("${USER_BACKUPS[@]}")
+        echo "Выбрано восстановление всех бэкапов"
     else
-        SELECTED_USER="${USER_MAP[$USER_CHOICE]}"
-        SELECTED_BACKUP="${USER_BACKUPS[$SELECTED_USER]}"
-        echo -e "${GREEN}Выбран бэкап для пользователя $SELECTED_USER: $SELECTED_BACKUP${NC}"
-    fi
-
-    if [ -n "$APT_BACKUP" ]; then
-        read -p "Восстановить список пакетов и источники? (y/n): " RESTORE_PKGS
-        if [ "$RESTORE_PKGS" = "y" ] && [ -f "$PACKAGE_LIST" ]; then
-            echo -e "${GREEN}Восстановление источников пакетов...${NC}"
-            sudo tar -xzf "$APT_BACKUP" -C / etc/apt/sources.list etc/apt/sources.list.d
-            if [ $? -eq 0 ]; then
-                echo "Источники пакетов восстановлены"
-            else
-                echo -e "${RED}Ошибка при восстановлении источников${NC}"
-            fi
-
-            echo -e "${GREEN}Восстановление списка пакетов...${NC}"
-            sudo dpkg --set-selections < "$PACKAGE_LIST"
-            sudo apt-get -y dselect-upgrade
-            if [ $? -eq 0 ]; then
-                echo "Список пакетов восстановлен"
-            else
-                echo -e "${RED}Ошибка при восстановлении пакетов${NC}"
-            fi
+        if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt $TOTAL_BACKUPS ]; then
+            echo -e "${RED}Неверный выбор${NC}"
+            return
         fi
+        SELECTED_BACKUPS=("${BACKUP_LIST[$CHOICE]}")
+        echo "Выбран бэкап: ${SELECTED_BACKUPS[0]}"
     fi
 
-    if [ -n "$SELECTED_USER" ]; then
-        read -p "Восстановить домашнюю директорию $SELECTED_USER? (y/n): " RESTORE_HOME
-        if [ "$RESTORE_HOME" = "y" ]; then
-            echo -e "${GREEN}Восстановление домашней директории $SELECTED_USER...${NC}"
-            sudo tar -xzf "$SELECTED_BACKUP" -C / "home/$SELECTED_USER"
-            if [ $? -eq 0 ]; then
-                echo "Директория пользователя $SELECTED_USER восстановлена"
-            else
-                echo -e "${RED}Ошибка при восстановлении $SELECTED_USER${NC}"
-                return
-            fi
+    # Проверка свободного места перед восстановлением
+    FREE_SPACE=$(get_free_space)
+    echo "Свободное место на диске: $FREE_SPACE МБ"
+    for backup in "${SELECTED_BACKUPS[@]}"; do
+        BACKUP_SIZE=$(ls -l "$backup" | awk '{print int($5 / 1024 / 1024)}')  # Размер файла в МБ
+        echo "Размер бэкапа $backup: $BACKUP_SIZE МБ"
+        if [ "$BACKUP_SIZE" -gt "$FREE_SPACE" ]; then
+            echo -e "${RED}Недостаточно свободного места для восстановления $backup (требуется $BACKUP_SIZE МБ, доступно $FREE_SPACE МБ)${NC}"
+            return
+        fi
+    done
 
-            # Проверка и создание пользователя
-            if ! id "$SELECTED_USER" >/dev/null 2>&1; then
-                echo -e "${RED}Пользователь $SELECTED_USER не существует${NC}"
-                read -p "Создать пользователя $SELECTED_USER? (y/n): " CREATE_USER
-                if [ "$CREATE_USER" = "y" ]; then
-                    sudo useradd -m -d "/home/$SELECTED_USER" -s /bin/bash "$SELECTED_USER"
-                    if [ $? -eq 0 ]; then
-                        echo "Пользователь $SELECTED_USER создан"
-                        sudo chown -R "$SELECTED_USER:$SELECTED_USER" "/home/$SELECTED_USER"
-                        read -p "Установить пароль для $SELECTED_USER? (y/n): " SET_PASSWD
-                        if [ "$SET_PASSWD" = "y" ]; then
-                            sudo passwd "$SELECTED_USER"
+    # Восстановление выбранных бэкапов
+    for backup in "${SELECTED_BACKUPS[@]}"; do
+        if [[ "$backup" =~ home_backup_(.+)_[0-9]{8}_[0-9]{6}\.tar\.gz ]]; then
+            USER="${BASH_REMATCH[1]}"
+            echo -e "${GREEN}Восстановление пользователя $USER...${NC}"
+            sudo tar -xzf "$backup" -C / "home/$USER"
+            if [ $? -eq 0 ]; then
+                echo "Домашняя директория $USER восстановлена"
+                
+                # Проверка существования пользователя
+                if ! id "$USER" >/dev/null 2>&1; then
+                    echo -e "${RED}Пользователь $USER не существует в системе${NC}"
+                    read -p "Создать пользователя $USER? (y/n): " CREATE_USER
+                    if [ "$CREATE_USER" = "y" ]; then
+                        sudo useradd -m -d "/home/$USER" -s /bin/bash "$USER"
+                        if [ $? -eq 0 ]; then
+                            echo "Пользователь $USER создан"
+                            sudo chown -R "$USER:$USER" "/home/$USER"  # Установка прав
+                            read -p "Установить пароль для $USER? (y/n): " SET_PASSWD
+                            if [ "$SET_PASSWD" = "y" ]; then
+                                sudo passwd "$USER"
+                            else
+                                echo "Пароль для $USER не установлен"
+                            fi
+                        else
+                            echo -e "${RED}Ошибка при создании пользователя $USER${NC}"
                         fi
                     else
-                        echo -e "${RED}Ошибка при создании $SELECTED_USER${NC}"
+                        echo "Пользователь $USER не создан"
                     fi
+                else
+                    echo "Пользователь $USER уже существует в системе"
+                    sudo chown -R "$USER:$USER" "/home/$USER"  # Установка прав для существующего пользователя
                 fi
             else
-                echo "Пользователь $SELECTED_USER уже существует"
-                sudo chown -R "$SELECTED_USER:$SELECTED_USER" "/home/$SELECTED_USER"
+                echo -e "${RED}Ошибка при восстановлении $USER${NC}"
+                continue
             fi
+        else
+            echo -e "${RED}Не удалось распознать пользователя в $backup${NC}"
+            continue
         fi
-    fi
+    done
 }
 
-# Функция для удаления локальных бэкапов
+# Функция для удаления бэкапов
 delete_backups() {
-    echo -e "${GREEN}Доступные локальные бэкапы:${NC}"
-    BACKUP_DIR="$LOCAL_BACKUP_DIR/backups"
-    BACKUP_FILES=("$BACKUP_DIR"/home_backup_*.tar.gz "$BACKUP_DIR"/apt_sources_backup_*.tar.gz)
-    if [ ${#BACKUP_FILES[@]} -eq 0 ] || [ ! -e "${BACKUP_FILES[0]}" ]; then
-        echo -e "${RED}Локальные бэкапы не найдены в $BACKUP_DIR${NC}"
+    if [ ! -d "$BACKUP_DIR" ]; then
+        echo -e "${RED}Папка бэкапов $BACKUP_DIR не найдена${NC}"
         return
     fi
 
+    BACKUP_FILES=("$BACKUP_DIR"/home_backup_*.tar.gz)
+    if [ ${#BACKUP_FILES[@]} -eq 0 ] || [ ! -e "${BACKUP_FILES[0]}" ]; then
+        echo -e "${RED}Бэкапы не найдены в $BACKUP_DIR${NC}"
+        return
+    fi
+
+    echo -e "${GREEN}Доступные бэкапы:${NC}"
     for i in "${!BACKUP_FILES[@]}"; do
         DATETIME=$(get_backup_datetime "${BACKUP_FILES[$i]}")
         echo "$((i+1)). ${BACKUP_FILES[$i]} (Создан: $DATETIME)"
     done
     echo "q. Вернуться в главное меню"
-    read -p "Введите номера бэкапов для удаления (или 'q'): " CHOICES
+    read -p "Введите номера бэкапов для удаления через пробел (или 'q'): " CHOICES
+
     if [ "$CHOICES" = "q" ]; then
         echo "Возврат в главное меню."
         return
@@ -471,7 +275,7 @@ delete_backups() {
         fi
         SELECTED_BACKUP="${BACKUP_FILES[$((CHOICE-1))]}"
         echo -e "${GREEN}Удаление: $SELECTED_BACKUP${NC}"
-        rm -f "$SELECTED_BACKUP"
+        sudo rm -f "$SELECTED_BACKUP"
         if [ $? -eq 0 ]; then
             echo "Бэкап удалён"
         else
@@ -493,24 +297,23 @@ get_backup_datetime() {
     fi
 }
 
-# Основное меню
+# Главное меню
 while true; do
     clear
     echo -e "${GREEN}=== Меню управления бэкапами ===${NC}"
-    echo "1. Создать бэкап"
-    echo "2. Развернуть бэкап (локальный)"
-    echo "3. Удалить локальные бэкапы"
-    echo "4. Перезагрузить ПК"
-    echo "5. Выйти"
-    read -p "Выберите опцию (1-5): " choice
+    echo "1. Создать бэкап пользователей"
+    echo "2. Восстановить бэкап пользователей"
+    echo "3. Удалить бэкапы"
+    echo "4. Выйти"
+    read -p "Выберите опцию (1-4): " choice
 
     case $choice in
         1)
-            create_backup
+            backup_users
             read -p "Нажмите Enter для продолжения..."
             ;;
         2)
-            restore_backup
+            restore_users
             read -p "Нажмите Enter для продолжения..."
             ;;
         3)
@@ -518,10 +321,6 @@ while true; do
             read -p "Нажмите Enter для продолжения..."
             ;;
         4)
-            echo "Перезагрузка ПК..."
-            sudo reboot
-            ;;
-        5)
             echo "Выход из скрипта."
             exit 0
             ;;
